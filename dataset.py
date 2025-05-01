@@ -1,41 +1,62 @@
-
-import os
-import glob
+# dataset.py -----------------------------------------------------------
+import os, glob, random
 from PIL import Image
+from typing import List, Tuple
 import torch
-from torch.utils.data import Dataset
-from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
 
-class EffectSequenceDataset(Dataset):
-    def __init__(self, root, img_size=128, style_list=None):
-        self.root = root
-        self.img_size = img_size
-        self.folders = sorted([f for f in os.listdir(root) if os.path.isdir(os.path.join(root, f))])
-        self.samples = []
-        for folder in self.folders:
-            img_paths = sorted(glob.glob(os.path.join(root, folder, "*.png")))
-            if len(img_paths) > 1:
-                self.samples.append((img_paths[0], img_paths, folder))  # (x_path, y_paths, style_name)
+IMG_SIZE = 128          # 수정 가능
+EXT = ("*.png", "*.jpg", "*.jpeg")
 
-        self.style_list = style_list if style_list else sorted(set(folder for _, _, folder in self.samples))
-        self.style_to_idx = {style: i for i, style in enumerate(self.style_list)}
+def _list_imgs(folder: str) -> List[str]:
+    files = []
+    for e in EXT:
+        files += glob.glob(os.path.join(folder, e))
+    return sorted(files)
 
-        self.transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
+class EffectDataset(Dataset):
+    """dataset/<style_name>/*.png  구조를 자동 인식"""
+    def __init__(self, root="dataset", img_size: int = IMG_SIZE):
+        self.samples: List[Tuple[str, int]] = []
+        self.styles: List[str] = sorted([d for d in os.listdir(root)
+                                         if os.path.isdir(os.path.join(root, d))])
+        for idx, style in enumerate(self.styles):
+            for f in _list_imgs(os.path.join(root, style)):
+                self.samples.append((f, idx))
+
+        self.resize_norm = T.Compose([
+            T.Resize((IMG_SIZE, IMG_SIZE), interpolation=T.InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize([0.5]*4, [0.5]*4)   # RGBA 4-채널
         ])
+
+        self.num_styles = len(self.styles)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        x_path, y_paths, style_name = self.samples[idx]
-        x_img = self.transform(Image.open(x_path).convert("RGB"))
-        y_imgs = torch.stack([
-            self.transform(Image.open(p).convert("RGB")) for p in y_paths
-        ])
-        style_idx = self.style_to_idx[style_name]
-        style_onehot = torch.zeros(len(self.style_list))
-        style_onehot[style_idx] = 1.0
-        return x_img, y_imgs, style_onehot
+        path, cls_idx = self.samples[idx]
+
+        # 이미지 열고 RGBA 변환
+        img = Image.open(path).convert("RGBA")
+
+        # 가장 짧은 변 기준 중앙 정사각 크롭
+        w, h = img.size
+        s = min(w, h)
+        left, top = (w - s) // 2, (h - s) // 2
+        img = img.crop((left, top, left + s, top + s))
+
+        # 리사이즈 + 정규화
+        img = self.resize_norm(img)
+
+        # one-hot style 벡터
+        c = torch.zeros(self.num_styles)
+        c[cls_idx] = 1.0
+        return img, img, c
+
+def build_loader(batch=8, shuffle=True, root="dataset"):
+    ds = EffectDataset(root)
+    return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=4,
+                      pin_memory=True, drop_last=True), ds.num_styles
